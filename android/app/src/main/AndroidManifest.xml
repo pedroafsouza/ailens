@@ -29,5 +29,6 @@
         <data android:scheme="ailens"/>
       </intent-filter>
     </activity>
+    <uses-native-library android:name="libOpenCL.so" android:required="false"/>
   </application>
 </manifest>
