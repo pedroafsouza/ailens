@@ -20,8 +20,8 @@ export function useObstacleDetector() {
   }, [])
 
   const OBSTACLE_HYSTERESIS = React.useMemo(() => {
-    const v = parseFloat(process.env.OBSTACLE_HYSTERESIS ?? '0.05')
-    return Number.isFinite(v) && v >= 0 && v <= 1 ? v : 0.05
+    const v = parseFloat(process.env.OBSTACLE_HYSTERESIS ?? '0.15')
+    return Number.isFinite(v) && v >= 0 ? v : 0.15
   }, [])
 
   const OBSTACLE_SUDDEN_DELTA = React.useMemo(() => {
