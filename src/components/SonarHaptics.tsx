@@ -1,5 +1,6 @@
 import * as Haptics from 'expo-haptics'
 import * as React from 'react'
+import { isDetectionPaused } from '../hooks/useDetectionPause'
 
 interface SonarHapticsProps {
   obstacleDetected: boolean
@@ -12,6 +13,17 @@ export function SonarHaptics({ obstacleDetected, obstacleHeight, obstacleConfide
   const currentSonarInterval = React.useRef<number | null>(null)
   
   React.useEffect(() => {
+    // Stop haptics if detection is paused
+    if (isDetectionPaused()) {
+      if (hapticIntervalRef.current !== null) {
+        console.log(`Sonar paused - detection disabled`)
+        clearInterval(hapticIntervalRef.current)
+        hapticIntervalRef.current = null
+        currentSonarInterval.current = null
+      }
+      return
+    }
+
     if (obstacleDetected && obstacleHeight !== null && obstacleConfidence !== null) {
       const normalizedDistance = Math.max(0, Math.min(1, (obstacleHeight - 0.25) / (1.0 - 0.25)))
       

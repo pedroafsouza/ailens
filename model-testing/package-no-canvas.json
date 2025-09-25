@@ -1,0 +1,19 @@
+{
+  "name": "ssd-mobilenet-model-testing",
+  "version": "1.0.0",
+  "description": "Testing framework for SSD MobileNet model to debug detection issues",
+  "main": "test-model.js",
+  "scripts": {
+    "setup": "node collect-images.js",
+    "test": "node test-model.js",
+    "test-synthetic": "node test-model.js --synthetic-only",
+    "full-test": "npm run setup && npm run test"
+  },
+  "dependencies": {
+    "@tensorflow/tfjs-node": "^4.15.0",
+    "axios": "^1.6.0",
+    "fs-extra": "^11.2.0"
+  },
+  "author": "AILens Team",
+  "license": "MIT"
+}

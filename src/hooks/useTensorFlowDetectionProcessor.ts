@@ -1,68 +1,83 @@
 import * as React from 'react'
 import { useObstacleDetectionConfig } from './useObstacleDetectionConfig'
 
-// Improved spatial analysis for walking hazards - considers small ground-level obstacles
+// Trust the COCO-trained model more - minimal filtering for walking hazards
 function isWalkingHazard(box: number[], confidence: number, frameWidth = 320, frameHeight = 320): boolean {
   const [ymin, xmin, ymax, xmax] = box
   
-  // Calculate dimensions and position
+  // Calculate basic properties
   const height = ymax - ymin
   const width = xmax - xmin
   const centerX = (xmin + xmax) / 2
-  const centerY = (ymin + ymax) / 2
   const area = height * width
-  const aspectRatio = width / height
   
-  // EXCLUDE: Obvious non-hazards
-  
-  // 1. Tiny noise (very small AND very low confidence)
-  if (area < 0.005 && confidence < 0.4) return false // < 0.5% frame AND low confidence
-  
-  // 2. Sky/ceiling objects (unless they're large and could be overhead hazards)
-  if (ymax < 0.2 && area < 0.1) return false // Top 20% AND small
-  
-  // 3. Very wide thin horizontal bands (floor lines, horizons)
-  if (aspectRatio > 6 && height < 0.08 && centerY > 0.6) return false // Wide, thin, bottom area
-  
-  // 4. Full-width floor/wall spans
-  if (width > 0.9 && centerY > 0.8) return false // Nearly full width in bottom area
-  
-  // INCLUDE: Walking hazards (including small ground-level ones)
-  
-  // 5. Ground-level objects (boxes, curbs, etc.) - even if small
-  const isGroundLevel = ymax > 0.5 // Bottom half of frame
-  const isReasonableSize = area > 0.002 // > 0.2% of frame (quite small)
-  const isWalkingPath = Math.abs(centerX - 0.5) < 0.4 // Within walking path
-  
-  if (isGroundLevel && isReasonableSize && isWalkingPath) {
-    // Small ground objects need much higher confidence to be considered hazards
-    if (confidence > 0.6) return true  // Increased from 0.4 to 0.6
+  // Debug logging for rejections
+  const debugInfo = {
+    confidence: confidence.toFixed(3),
+    area: area.toFixed(4),
+    centerX: centerX.toFixed(3),
+    ymax: ymax.toFixed(3),
+    aspectRatio: (width/height).toFixed(2)
   }
   
-  // 6. Larger objects anywhere in walking area - be much more selective
-  if (area > 0.05 && isWalkingPath && confidence > 0.5) return true // > 5% frame, much higher confidence
+  // TRUST THE MODEL - Minimal filtering to reduce false rejections
   
-  // 7. High confidence objects (probably real regardless of size) - be very restrictive
-  if (confidence > 0.8 && area > 0.01 && isWalkingPath) return true // Very confident detection, in path
+  // 1. Lower confidence threshold - trust the model's sigmoid scores
+  if (confidence < 0.25) {
+    // console.log(`[Filter] REJECT confidence: ${debugInfo.confidence} < 0.25`)
+    return false // Lowered from 0.55 to 0.25 - trust model more
+  }
   
-  // Default: not a hazard
-  return false
+  // 2. More permissive size filtering 
+  if (area < 0.002) {
+    console.log(`[Filter] REJECT area too small: ${debugInfo.area} < 0.002`)
+    return false // Very small objects only (< 0.2% of frame)
+  }
+  if (area > 0.9) {
+    console.log(`[Filter] REJECT area too large: ${debugInfo.area} > 0.9`)
+    return false   // Only reject obviously full-screen detections
+  }
+  
+  // 3. Broader position filtering - don't over-constrain walking area
+  const isInReasonableArea = centerX >= 0.1 && centerX <= 0.9 // 80% of screen width
+  if (!isInReasonableArea) {
+    console.log(`[Filter] REJECT position: centerX=${debugInfo.centerX} not in [0.1, 0.9]`)
+    return false
+  }
+  
+  // 4. More lenient ground requirement - allow elevated obstacles
+  const isReachable = ymax > 0.3 // Extends into bottom 70% of frame (was 60%)
+  if (!isReachable) {
+    console.log(`[Filter] REJECT not grounded: ymax=${debugInfo.ymax} <= 0.3`)
+    return false
+  }
+  
+  // 5. Remove overly strict size-based requirements
+  // Trust that the model's confidence already accounts for relevance
+  
+  // 6. More lenient aspect ratio - allow wider objects
+  const aspectRatio = width / height
+  if (aspectRatio > 5.0) {
+    console.log(`[Filter] REJECT aspect ratio: ${debugInfo.aspectRatio} > 5.0`)
+    return false // Only reject extremely wide objects (was 3.0)
+  }
+  
+  // If we get here, it's a valid walking hazard
+  console.log(`[Filter] ACCEPT: conf=${debugInfo.confidence}, area=${debugInfo.area}, pos=${debugInfo.centerX}, ground=${debugInfo.ymax}`)
+  
+  // TRUST THE MODEL - it's COCO-trained and knows what obstacles look like
+  return true
 }
 
 interface Detection {
   height: number
   confidence: number
-}
-
-interface TrackedTarget {
-  box: number[]  // [ymin, xmin, ymax, xmax]
-  confidence: number
-  height: number
-  centerX: number
-  centerY: number
-  area: number
-  lastSeen: number 
-  trackingId: string
+  boundingBox?: {
+    x: number
+    y: number
+    width: number
+    height: number
+  }
 }
 
 interface TensorFlowDetectionProcessorProps {
@@ -87,34 +102,12 @@ export function useTensorFlowDetectionProcessor({
   
   const config = useObstacleDetectionConfig()
   const lastDetectionTime = React.useRef(0)
+  const lastReportedDistance = React.useRef(0)
+  const stableDetectionCount = React.useRef(0)
+  const currentStableDistance = React.useRef(0)
   
-  // Target tracking state
-  const currentTarget = React.useRef<TrackedTarget | null>(null)
-  const lastReportedDistance = React.useRef<number | null>(null)
-  const TARGET_LOSS_FRAMES = 30 // Lose lock after 30 frames without detection
-  const TARGET_MATCH_THRESHOLD = 0.3 // IoU threshold for matching detections
-  const MIN_DISTANCE_CHANGE = 0.1 // Minimum distance change to report (10cm)
-  
-  // Calculate Intersection over Union for box matching
-  const calculateIoU = React.useCallback((box1: number[], box2: number[]): number => {
-    const [y1min, x1min, y1max, x1max] = box1
-    const [y2min, x2min, y2max, x2max] = box2
-    
-    const intersectionXMin = Math.max(x1min, x2min)
-    const intersectionYMin = Math.max(y1min, y2min)
-    const intersectionXMax = Math.min(x1max, x2max)
-    const intersectionYMax = Math.min(y1max, y2max)
-    
-    const intersectionWidth = Math.max(0, intersectionXMax - intersectionXMin)
-    const intersectionHeight = Math.max(0, intersectionYMax - intersectionYMin)
-    const intersectionArea = intersectionWidth * intersectionHeight
-    
-    const box1Area = (x1max - x1min) * (y1max - y1min)
-    const box2Area = (x2max - x2min) * (y2max - y2min)
-    const unionArea = box1Area + box2Area - intersectionArea
-    
-    return unionArea > 0 ? intersectionArea / unionArea : 0
-  }, [])
+  // Simple approach: No target tracking, just find closest obstacle each frame
+  // BUT add stability and smoothing for practical use
   
   // Convert height to distance estimate (simplified)
   const heightToDistance = React.useCallback((height: number): number => {
@@ -125,142 +118,118 @@ export function useTensorFlowDetectionProcessor({
 
   React.useEffect(() => {
     if (!confidenceScores) return
-
-    // Step 1: Parse all valid detections from this frame
-    const currentDetections: TrackedTarget[] = []
-    let CONFIDENCE_THRESHOLD = config.OBSTACLE_MIN_CONFIDENCE * 0.7
     
-    for (let i = 0; i < confidenceScores.length; i++) {
-      const confidence = Number(confidenceScores[i])
-      if (confidence < CONFIDENCE_THRESHOLD) continue
-      
-      // Get the bounding box for spatial analysis
-      let box: number[] | null = null
-      if (Array.isArray(boxes[i])) {
-        box = boxes[i]
-      } else if (typeof boxes[i * 4] === 'number') {
-        const idx = i * 4
-        box = [boxes[idx], boxes[idx + 1], boxes[idx + 2], boxes[idx + 3]]
-      }
-      
-      if (!box) continue
-      
-      // Use spatial analysis to filter for walking hazards
-      const isHazard = isWalkingHazard(box, confidence)
-      if (!isHazard) continue
-      
-      // Create detection object
-      const [ymin, xmin, ymax, xmax] = box
-      const height = ymax - ymin
-      const width = xmax - xmin
-      const centerX = (xmin + xmax) / 2
-      const centerY = (ymin + ymax) / 2
-      const area = height * width
-      
-      currentDetections.push({
-        box,
-        confidence,
-        height,
-        centerX,
-        centerY,
-        area,
-        lastSeen: frameCount,
-        trackingId: `${frameCount}-${i}` // Temporary ID
-      })
-    }
+    // Simple approach: Process all detections each frame, find closest obstacle
+    if (frameCount <= 0) return
     
-    // Step 2: Target tracking logic
-    let trackedObstacle: TrackedTarget | null = null
+    // Step 1: Extract all valid detections from model output
+    const currentDetections: Array<{
+      box: number[]
+      confidence: number
+      height: number
+      area: number
+    }> = []
     
-    if (currentTarget.current) {
-      // Try to find matching detection for current target
-      const target = currentTarget.current
-      let bestMatch: TrackedTarget | null = null
-      let bestIoU = 0
+    if (boxes && confidenceScores) {
+      const numDetections = Math.min(10, Math.floor(boxes.length / 4))
       
-      for (const detection of currentDetections) {
-        const iou = calculateIoU(target.box, detection.box)
-        if (iou > TARGET_MATCH_THRESHOLD && iou > bestIoU) {
-          bestMatch = detection
-          bestIoU = iou
-        }
-      }
-      
-      if (bestMatch) {
-        // Update existing target with new information
-        trackedObstacle = {
-          ...bestMatch,
-          trackingId: target.trackingId, // Keep same tracking ID
-          lastSeen: frameCount
-        }
-        currentTarget.current = trackedObstacle
+      for (let i = 0; i < numDetections; i++) {
+        const boxIndex = i * 4
+        const box = [
+          Number(boxes[boxIndex]),     // ymin
+          Number(boxes[boxIndex + 1]), // xmin
+          Number(boxes[boxIndex + 2]), // ymax
+          Number(boxes[boxIndex + 3])  // xmax
+        ]
         
-        console.log(`[TargetTrack] Updated target ${target.trackingId}, IoU: ${bestIoU.toFixed(3)}, conf: ${bestMatch.confidence.toFixed(3)}`)
-      } else {
-        // Check if target has been lost for too long
-        const framesSinceLastSeen = frameCount - target.lastSeen
-        if (framesSinceLastSeen > TARGET_LOSS_FRAMES) {
-          console.log(`[TargetTrack] Lost target ${target.trackingId} after ${framesSinceLastSeen} frames`)
-          currentTarget.current = null
-          lastReportedDistance.current = null // Clear distance tracking
-        } else {
-          // Keep existing target but mark as not updated
-          trackedObstacle = target
-          console.log(`[TargetTrack] Target ${target.trackingId} not found, frames since last seen: ${framesSinceLastSeen}`)
+        const confidence = Number(confidenceScores[i])
+        
+        // Skip invalid detections
+        if (isNaN(confidence) || box.some(isNaN)) continue
+        
+        // Calculate detection properties
+        const [ymin, xmin, ymax, xmax] = box
+        const height = ymax - ymin
+        const width = xmax - xmin
+        const area = height * width
+        
+        // Apply filtering - trust the model but filter obvious noise
+        if (isWalkingHazard(box, confidence)) {
+          currentDetections.push({
+            box,
+            confidence,
+            height,
+            area
+          })
         }
       }
     }
     
-    // Step 3: Acquire new target if none exists
-    if (!trackedObstacle && currentDetections.length > 0) {
-      // Find closest detection (largest height = closest in simple model)
-      const closestDetection = currentDetections.reduce((closest, current) => 
-        current.height > closest.height ? current : closest
-      )
+    // Step 2: Find closest obstacle with stability filtering
+    if (currentDetections.length > 0) {
+      // Sort by height (descending) to get closest obstacle first
+      const sortedByCloseness = currentDetections.sort((a, b) => b.height - a.height)
+      const closestObstacle = sortedByCloseness[0]
       
-      trackedObstacle = {
-        ...closestDetection,
-        trackingId: `target-${frameCount}`
+      // Convert to distance and add stability
+      const distance = heightToDistance(closestObstacle.height)
+      const distanceCm = Math.round(distance * 100)
+      
+      // STABILITY: Only report if distance is stable or significantly different
+      const distanceDiff = Math.abs(distanceCm - currentStableDistance.current)
+      
+      if (distanceDiff <= 10) {
+        // Distance is stable (within 10cm) - count consecutive stable detections
+        stableDetectionCount.current++
+      } else {
+        // Distance changed significantly - reset stability counter
+        stableDetectionCount.current = 1
+        currentStableDistance.current = distanceCm
       }
-      currentTarget.current = trackedObstacle
       
-      console.log(`[TargetTrack] Acquired new target ${trackedObstacle.trackingId}, height: ${trackedObstacle.height.toFixed(3)}, conf: ${trackedObstacle.confidence.toFixed(3)}`)
-    }
-    
-    // Step 4: Report tracked obstacle (with movement filtering)
-    if (trackedObstacle) {
-      const distance = heightToDistance(trackedObstacle.height)
+      // Only report if we have stable detection for 3+ frames AND meaningful change
+      const meaningfulChange = Math.abs(distanceCm - lastReportedDistance.current) >= 20 // 20cm threshold
+      const isStable = stableDetectionCount.current >= 3
       
-      // Check if distance has changed significantly
-      const lastDistance = lastReportedDistance.current
-      const distanceChanged = lastDistance === null || Math.abs(distance - lastDistance) >= MIN_DISTANCE_CHANGE
-      
-      if (distanceChanged) {
+      if (isStable && (meaningfulChange || lastReportedDistance.current === 0)) {
         const detection: Detection = {
           height: distance,
-          confidence: trackedObstacle.confidence
+          confidence: closestObstacle.confidence,
+          boundingBox: {
+            x: closestObstacle.box[1], // xmin (normalized)
+            y: closestObstacle.box[0], // ymin (normalized)  
+            width: closestObstacle.box[3] - closestObstacle.box[1], // width
+            height: closestObstacle.box[2] - closestObstacle.box[0]  // height
+          }
         }
         
-        // Check rate limiting
-        const now = Date.now()
-        if (now - lastDetectionTime.current >= cooldownMs) {
-          lastDetectionTime.current = now
-          lastReportedDistance.current = distance
+        // Rate limiting - only report if enough time has passed
+        const currentTime = Date.now()
+        if (currentTime - lastDetectionTime.current >= cooldownMs) {
+          console.log(`[Stable Detection] Obstacle confirmed: ${distanceCm}cm distance, ${(closestObstacle.confidence * 100).toFixed(1)}% confidence (stable for ${stableDetectionCount.current} frames)`)
           onDetection(detection)
-          
-          console.log(`[TargetTrack] Reporting obstacle: ${(distance * 100).toFixed(0)}cm distance, ${(trackedObstacle.confidence * 100).toFixed(1)}% confidence (changed by ${lastDistance ? Math.abs(distance - lastDistance).toFixed(2) : 'N/A'}m)`)
-        } else {
-          // Still report for logging but note rate limiting
-          onFallbackDetection(detection)
-          console.log(`[TargetTrack] Rate limited: ${(distance * 100).toFixed(0)}cm distance, ${(trackedObstacle.confidence * 100).toFixed(1)}% confidence`)
+          lastDetectionTime.current = currentTime
+          lastReportedDistance.current = distanceCm
         }
-      } else {
-        // Distance hasn't changed significantly - suppress report
-        console.log(`[TargetTrack] Suppressed static obstacle: ${(distance * 100).toFixed(0)}cm distance (no significant movement)`)
       }
-    } else if (currentTarget.current === null) {
-      // No target and no new acquisitions - clear state if needed
-      console.log(`[TargetTrack] No obstacles detected in frame ${frameCount}`)
+    } else {
+      // No detections - reset stability tracking
+      stableDetectionCount.current = 0
+      currentStableDistance.current = 0
     }
-  }, [boxes, classIds, confidenceScores, frameCount, onDetection, onFallbackDetection, cooldownMs, config.OBSTACLE_MIN_CONFIDENCE, calculateIoU, heightToDistance])
+    
+    // Log detection summary periodically
+    if (frameCount % 30 === 0) {
+      console.log(`[Simple Detection] Frame ${frameCount}: ${currentDetections.length} valid obstacles detected`)
+      if (currentDetections.length > 0) {
+        const closest = currentDetections.sort((a, b) => b.height - a.height)[0]
+        const distance = heightToDistance(closest.height)
+        console.log(`[Simple Detection] Closest: ${(distance * 100).toFixed(0)}cm, ${(closest.confidence * 100).toFixed(1)}% confidence`)
+      }
+    }
+  }, [boxes, classIds, confidenceScores, frameCount, onDetection, onFallbackDetection, cooldownMs, heightToDistance])
+
+  return null
 }
+
+export default useTensorFlowDetectionProcessor
